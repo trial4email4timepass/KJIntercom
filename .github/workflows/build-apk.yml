@@ -2,7 +2,11 @@ name: Build APK
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -22,8 +26,18 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
           ./gradlew --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk KJIntercom.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: KJIntercom-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: KJIntercom.apk
+
+      - name: Publish as "latest" release (easy phone download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest KJIntercom.apk \
+            --title "KJ Intercom (build ${{ github.run_number }})" \
+            --notes "Tap KJIntercom.apk below to download, then install it on both phones."

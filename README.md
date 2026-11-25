@@ -24,7 +24,7 @@ Phone A ◄──────── "✓✓ Played" ◄────────�
 ### Option A: GitHub (no Android Studio needed)
 1. Create a new GitHub repository and upload this whole folder (keep the `.github` folder).
 2. Open the repo's **Actions** tab. The **Build APK** workflow runs automatically (about 5 minutes).
-3. Open the finished run and download the **KJIntercom-apk** artifact (a zip containing `app-release.apk`).
+3. Open the repo's **Releases** → **latest** and tap **KJIntercom.apk** (works right from your phone).
 
 ### Option B: Android Studio
 1. File → Open → choose this folder. Let Gradle sync.

@@ -2,7 +2,9 @@ package com.khalsa.intercom.net
 
 import java.io.OutputStream
 import java.net.InetSocketAddress
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
@@ -51,7 +53,7 @@ class MqttClient(
     @Volatile private var lastPingMs = 0L
     @Volatile private var pingSentMs = 0L
     private var managerThread: Thread? = null
-    private val writeLock = Any()
+    private val writeLock = ReentrantLock()
     private val subLock = Any()
     private val subscriptions = LinkedHashSet<String>()
     private val packetIds = AtomicInteger(1)
@@ -109,10 +111,30 @@ class MqttClient(
 
     private fun writeRaw(bytes: ByteArray) {
         val out = output ?: throw IllegalStateException("not connected")
-        synchronized(writeLock) {
+        writeLock.lock()
+        try {
             out.write(bytes)
             out.flush()
+        } finally {
+            writeLock.unlock()
         }
+    }
+
+    /**
+     * Ping write that never waits behind a stuck sender. If a big clip write is blocked on a
+     * dead mobile link, the ping thread must stay free to notice the silence and close the
+     * socket (which also unblocks that writer). Returns false when the lock was busy.
+     */
+    private fun tryWritePing(): Boolean {
+        val out = output ?: throw IllegalStateException("not connected")
+        if (!writeLock.tryLock(50, TimeUnit.MILLISECONDS)) return false
+        try {
+            out.write(MqttWire.encodePingreq())
+            out.flush()
+        } finally {
+            writeLock.unlock()
+        }
+        return true
     }
 
     private fun closeSocket() {
@@ -253,9 +275,10 @@ class MqttClient(
                 }
                 if (ps == 0L && now - lastPingMs >= PING_EVERY_MS) {
                     try {
-                        writeRaw(MqttWire.encodePingreq())
-                        lastPingMs = now
-                        pingSentMs = now
+                        if (tryWritePing()) {
+                            lastPingMs = now
+                            pingSentMs = now
+                        }
                     } catch (e: Exception) {
                         closeSocket()
                         return@Thread

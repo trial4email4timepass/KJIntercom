@@ -840,6 +840,9 @@ class IntercomService : Service() {
     fun pushState() {
         val now = System.currentTimeMillis()
         lastPush = now
+        // A voice message stops by itself at 30 s (or on a mic error). Leave "talking" state
+        // then too, so the button stops saying RECORDING and incoming messages can play.
+        if (mode == Mode.AWAY && transmitting && away?.isRecording == false) transmitting = false
         val snap = peers.snapshot()
         val chatSnap = synchronized(chatLock) { chatHistory.toList() }
         val eng = away

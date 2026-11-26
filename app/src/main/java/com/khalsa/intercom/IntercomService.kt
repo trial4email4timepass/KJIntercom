@@ -1,350 +1,965 @@
 package com.khalsa.intercom
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiManager
+import android.os.Binder
 import android.os.Build
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
-import org.eclipse.paho.client.mqttv3.DisconnectedBufferOptions
-import org.eclipse.paho.client.mqttv3.IMqttActionListener
-import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
-import org.eclipse.paho.client.mqttv3.IMqttToken
-import org.eclipse.paho.client.mqttv3.MqttAsyncClient
-import org.eclipse.paho.client.mqttv3.MqttCallbackExtended
-import org.eclipse.paho.client.mqttv3.MqttConnectOptions
-import org.eclipse.paho.client.mqttv3.MqttMessage
-import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
-import java.io.File
-import java.security.SecureRandom
-import java.text.DateFormat
-import java.util.Date
+import com.khalsa.intercom.core.AwayProtocol
+import com.khalsa.intercom.core.IntercomProtocol
+import com.khalsa.intercom.core.PeerTable
+import java.net.DatagramPacket
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.MulticastSocket
+import java.net.NetworkInterface
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 /**
- * Foreground service that keeps an always-on connection to the relay, so voice messages from
- * the paired phone are received and played automatically — no need to touch the phone.
+ * Always-on intercom service.
+ *  - PUBLIC / PRIVATE: live push-to-talk to phones on the same Wi-Fi (UDP multicast).
+ *  - AWAY: voice messages and chat to family phones anywhere, through [AwayEngine].
+ *  - BROADCAST: handled by the activity (records a note to share in other apps).
  */
-class IntercomService : Service(), MqttCallbackExtended {
+class IntercomService : Service() {
 
-    data class Received(val id: Long, val from: String, val time: Long, val file: File)
+    enum class Mode { PUBLIC, PRIVATE, BROADCAST, AWAY }
 
-    interface Listener {
-        fun onStatus(status: String) {}
-        fun onHistoryChanged() {}
-        fun onSent(msgId: Long, ok: Boolean, error: String?) {}
-        fun onPlayedByPeer(msgId: Long, peerName: String) {}
-        fun onPeerSeen(peerName: String) {}
+    data class PeerUi(val id: Int, val name: String, val speaking: Boolean)
+    data class AwayPeerUi(val id: Int, val name: String, val online: Boolean, val speaking: Boolean, val selected: Boolean)
+    data class ChatUi(
+        val senderId: Int,
+        val senderName: String,
+        val text: String,
+        val isPrivate: Boolean,
+        val mine: Boolean,
+        val timeMs: Long,
+        val away: Boolean
+    )
+
+    data class UiState(
+        val myName: String,
+        val peers: List<PeerUi>,
+        val transmitting: Boolean,
+        val speakingNow: String?,
+        val detail: String,
+        val mode: Mode,
+        val selectedPeerId: Int,
+        val chat: List<ChatUi>,
+        val awayPeers: List<AwayPeerUi>,
+        val selectedAwayId: Int,
+        val awayConnected: Boolean,
+        val familyCode: String
+    )
+
+    fun interface StateListener {
+        fun onState(state: UiState)
     }
 
-    companion object {
-        private const val CHANNEL_ID = "intercom"
-        private const val NOTIF_ID = 1
-        private const val MAX_HISTORY = 25
-
-        @Volatile var instance: IntercomService? = null
-            private set
-        @Volatile var status: String = "Off"
-            private set
-
-        val listeners = CopyOnWriteArraySet<Listener>()
-        val history = CopyOnWriteArrayList<Received>() // newest first
-
-        fun start(c: Context) {
-            val i = Intent(c, IntercomService::class.java)
-            if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i) else c.startService(i)
-        }
-
-        fun stop(c: Context) {
-            c.stopService(Intent(c, IntercomService::class.java))
-        }
+    inner class LocalBinder : Binder() {
+        val service: IntercomService get() = this@IntercomService
     }
 
+    private class ChatEntry(
+        val senderId: Int,
+        val text: String,
+        val isPrivate: Boolean,
+        val mine: Boolean,
+        val timeMs: Long,
+        val away: Boolean,
+        val senderName: String = ""
+    )
+
+    private val binder = LocalBinder()
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var worker: Handler
-    private lateinit var workerThread: HandlerThread
-    private lateinit var player: AudioPlayer
-    private val random = SecureRandom()
+    private val listeners = CopyOnWriteArrayList<StateListener>()
+    private val peers = PeerTable()
+    private val playQueue = LinkedBlockingQueue<ByteArray>(40)
+    private val netExec = Executors.newSingleThreadExecutor { r -> Thread(r, "lan-net").apply { isDaemon = true } }
+    private val chatLock = Any()
+    private val chatHistory = ArrayList<ChatEntry>()
 
-    @Volatile private var client: MqttAsyncClient? = null
-    @Volatile private var crypto: PairCrypto? = null
-    @Volatile private var started = false
-    private var myId = ""
-    private var myName = ""
+    @Volatile private var myId = 0
+    @Volatile var myName = ""
+        private set
+    @Volatile var mode = Mode.PUBLIC
+        private set
+    @Volatile var selectedPeerId = 0
+        private set
+    @Volatile private var running = false
+    @Volatile private var transmitting = false
+    @Volatile private var txGen = 0
+    @Volatile private var txPackets = 0
+    @Volatile private var silentFrames = 0
+    @Volatile private var silenceWarn = false
+    @Volatile private var micError: String? = null
+    @Volatile private var engineError: String? = null
+    @Volatile private var lastPush = 0L
+    @Volatile private var lastCollisionMs = 0L
+    @Volatile private var familyCode = ""
+    @Volatile private var selectedAwayMemberId = 0
+    @Volatile private var wifiIpText = ""
+    @Volatile private var wifiIpSnapshot = ""
+    @Volatile private var rxSocket: MulticastSocket? = null
+    @Volatile private var txSocket: MulticastSocket? = null
+    @Volatile private var groupAddr: InetAddress? = null
+    @Volatile private var recorder: AudioRecord? = null
+    @Volatile private var away: AwayEngine? = null
+    private var txThread: Thread? = null
+    private var player: AudioTrack? = null
+    private var audioManager: AudioManager? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    @Volatile private var stopped = false
-    @Volatile private var everConnected = false
-    private val seenIds = LinkedHashSet<Long>()
+    private var connectivity: ConnectivityManager? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var chatSeq = 0
 
-    // ---------------------------------------------------------------- lifecycle
+    override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
-        player = AudioPlayer(this)
-        workerThread = HandlerThread("intercom-net").also { it.start() }
-        worker = Handler(workerThread.looper)
-        createChannel()
-        goForeground("Starting…")
+        myId = Identity.id(this)
+        myName = Identity.name(this)
+        familyCode = FamilyCodeStore.code(this)
+        selectedAwayMemberId = FamilyCodeStore.selectedMember(this)
+        mode = FamilyCodeStore.modeName(this)?.let { name -> Mode.values().firstOrNull { it.name == name } } ?: Mode.PUBLIC
+        selectedPeerId = FamilyCodeStore.selectedPeer(this)
+        Notify.ensureChannel(this)
+        if (startInForeground()) startEngine() else stopSelf()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        goForeground(status) // every startForegroundService() call must be answered with startForeground()
-        if (!started) {
-            started = true
-            stopped = false
-            myId = Prefs.deviceId(this)
-            myName = Prefs.deviceName(this)
-            val code = Prefs.pairCode(this)
-            if (Prefs.normalizeCode(code).length < 8) {
-                setStatus("Set a pair code first")
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            if (Prefs.keepAwake(this)) acquireWakeLock()
-            worker.post {
-                crypto = PairCrypto(code) // key derivation takes a moment: keep it off the main thread
-                connect()
-            }
-        }
-        return START_STICKY
-    }
-
-    override fun onDestroy() {
-        stopped = true
-        instance = null
-        val c = client
-        client = null
-        worker.post {
-            try { c?.disconnectForcibly(500, 500) } catch (_: Exception) {}
-            try { c?.close() } catch (_: Exception) {}
-            workerThread.quitSafely()
-        }
-        player.release()
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
-        setStatus("Off")
-        super.onDestroy()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    // ---------------------------------------------------------------- connection
-
-    private fun connect() {
-        if (stopped) return
-        try {
-            val broker = Prefs.broker(this).trim().ifEmpty { Prefs.DEFAULT_BROKER }
-            val clientId = "kji" + myId.take(20)
-            val c = client ?: MqttAsyncClient(broker, clientId, MemoryPersistence()).also {
-                it.setCallback(this)
-                it.setBufferOpts(DisconnectedBufferOptions().apply {
-                    setBufferEnabled(true)        // queue messages sent while briefly offline
-                    setBufferSize(20)
-                    setPersistBuffer(false)
-                    setDeleteOldestMessages(true)
-                })
-                client = it
-            }
-            if (stopped) { try { c.close() } catch (_: Exception) {}; client = null; return }
-            val opts = MqttConnectOptions().apply {
-                setCleanSession(false)        // broker keeps messages for us during short drop-outs
-                setAutomaticReconnect(true)
-                setKeepAliveInterval(60)
-                setConnectionTimeout(20)
-                setMaxInflight(20)
-                val user = Prefs.brokerUser(this@IntercomService)
-                if (user.isNotEmpty()) {
-                    userName = user
-                    password = Prefs.brokerPass(this@IntercomService).toCharArray()
-                }
-            }
-            setStatus("Connecting…")
-            c.connect(opts, null, object : IMqttActionListener {
-                override fun onSuccess(asyncActionToken: IMqttToken?) { /* handled in connectComplete */ }
-                override fun onFailure(asyncActionToken: IMqttToken?, exception: Throwable?) {
-                    // Paho only auto-reconnects after a successful first connect, so retry ourselves.
-                    if (!everConnected && !stopped) {
-                        setStatus("No connection – retrying… (${exception?.message ?: "offline"})")
-                        worker.postDelayed({ connect() }, 5000)
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            setStatus("Error: ${e.message}")
-            worker.postDelayed({ connect() }, 10000)
-        }
-    }
-
-    override fun connectComplete(reconnect: Boolean, serverURI: String?) {
-        everConnected = true
-        val c = client ?: return
-        val topic = crypto?.topic ?: return
-        try {
-            c.subscribe(topic, 1)
-        } catch (e: Exception) {
-            setStatus("Subscribe failed: ${e.message}")
-            return
-        }
-        setStatus("Connected – listening")
-        sendControl(Packet.TYPE_PING, 0L)
-    }
-
-    override fun connectionLost(cause: Throwable?) {
-        setStatus("Connection lost – reconnecting…")
-    }
-
-    override fun deliveryComplete(token: IMqttDeliveryToken?) {}
-
-    override fun messageArrived(topic: String?, message: MqttMessage?) {
-        val bytes = message?.payload ?: return
-        worker.post { handleIncoming(bytes) }
-    }
-
-    // ---------------------------------------------------------------- receiving
-
-    private fun handleIncoming(bytes: ByteArray) {
-        val plain = crypto?.decrypt(bytes) ?: return
-        val p = Packet.parse(plain) ?: return
-        if (p.senderId == myId) return                 // our own message echoed back
-        synchronized(seenIds) {                        // QoS 1 may deliver twice
-            if (!seenIds.add(p.msgId)) return
-            if (seenIds.size > 200) seenIds.remove(seenIds.first())
-        }
-        notifyListeners { it.onPeerSeen(p.senderName) }
-        when (p.type) {
-            Packet.TYPE_AUDIO -> onAudio(p)
-            Packet.TYPE_ACK -> notifyListeners { it.onPlayedByPeer(p.ackOf, p.senderName) }
-            Packet.TYPE_PING -> { /* presence only */ }
-        }
-    }
-
-    private fun onAudio(p: Packet) {
-        if (p.audio.isEmpty()) return
-        val dir = File(cacheDir, "rx").apply { mkdirs() }
-        val f = File(dir, "rx_${p.msgId}.m4a")
-        f.writeBytes(p.audio)
-        val item = Received(p.msgId, p.senderName, System.currentTimeMillis(), f)
-        history.add(0, item)
-        while (history.size > MAX_HISTORY) history.removeAt(history.size - 1).file.delete()
-        notifyListeners { it.onHistoryChanged() }
-
-        val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(item.time))
-        main.post {
-            player.enqueue(f) {
-                sendControl(Packet.TYPE_ACK, p.msgId) // tell the sender it was played
-            }
-            updateNotification("Last message from ${p.senderName} at $time")
-        }
-    }
-
-    /** Replay an older message on request. */
-    fun replay(item: Received) {
-        main.post { player.enqueue(item.file) }
-    }
-
-    fun setHoldPlayback(hold: Boolean) {
-        main.post { player.holdPlayback = hold }
-    }
-
-    // ---------------------------------------------------------------- sending
-
-    /** Encrypts and sends a recorded clip. Returns the message id. */
-    fun sendAudio(file: File): Long {
-        val id = random.nextLong()
-        worker.post {
-            val ok = publish(Packet(Packet.TYPE_AUDIO, id, myId, myName, System.currentTimeMillis(), 0L, file.readBytes()))
-            file.delete()
-            notifyListeners { it.onSent(id, ok == null, ok) }
-        }
-        return id
-    }
-
-    private fun sendControl(type: Int, ackOf: Long) {
-        worker.post {
-            publish(Packet(type, random.nextLong(), myId, myName, System.currentTimeMillis(), ackOf))
-        }
-    }
-
-    /** Returns null on success, or an error message. Must run on the worker thread. */
-    private fun publish(p: Packet): String? {
-        val c = client ?: return "Not connected"
-        val cr = crypto ?: return "Not ready"
-        return try {
-            c.publish(cr.topic, cr.encrypt(p.toBytes()), 1, false)
-            null
-        } catch (e: Exception) {
-            e.message ?: "Send failed"
-        }
-    }
-
-    // ---------------------------------------------------------------- helpers
-
-    private fun setStatus(s: String) {
-        status = s
-        main.post {
-            if (instance != null) updateNotification(s)
-            listeners.forEach { it.onStatus(s) }
-        }
-    }
-
-    private fun notifyListeners(block: (Listener) -> Unit) {
-        main.post { listeners.forEach(block) }
-    }
-
-    @Suppress("WakelockTimeout")
-    private fun acquireWakeLock() {
-        if (wakeLock != null) return
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KJIntercom::listen").apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-    }
-
-    private fun createChannel() {
-        val ch = NotificationChannel(CHANNEL_ID, "Intercom", NotificationManager.IMPORTANCE_LOW)
-        ch.description = "Shows that the intercom is listening"
-        ch.setShowBadge(false)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
-    }
-
-    private fun buildNotification(text: String): Notification {
+    private fun startInForeground(): Boolean {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_stat_intercom)
-            .setContentTitle("Intercom is on")
-            .setContentText(text)
+        val notif: Notification = Notification.Builder(this, Notify.CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentTitle("KHALSA Intercom")
+            .setContentText("On — same Wi-Fi and internet (AWAY) messages play automatically")
             .setContentIntent(open)
             .setOngoing(true)
-            .setCategory(Notification.CATEGORY_SERVICE)
             .build()
-    }
-
-    private fun updateNotification(text: String) {
-        try {
-            getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
-        } catch (_: Exception) { /* notifications may be blocked by the user; the service still runs */ }
-    }
-
-    private fun goForeground(text: String) {
-        val n = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(NOTIF_ID, n)
+        val attempts = ArrayList<() -> Unit>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            attempts.add {
+                startForeground(
+                    Notify.ID, notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+            }
+            attempts.add { startForeground(Notify.ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE) }
         }
+        attempts.add { startForeground(Notify.ID, notif) }
+        for (attempt in attempts) {
+            try {
+                attempt()
+                return true
+            } catch (e: Exception) {
+            }
+        }
+        return false
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    // ---------------------------------------------------------------- engine
+
+    private fun startEngine() {
+        if (running) return
+        running = true
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            multicastLock = wifi.createMulticastLock("khalsa-intercom").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+        }
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "khalsa:intercom").apply { acquire() }
+        } catch (e: Exception) {
+        }
+        // Note: v2.2 forced the whole phone into "in call" audio mode for as long as the app
+        // ran. That re-routes and mutes media audio on many phones. Push-to-talk is half
+        // duplex (we never play while recording), so normal mode is correct.
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        openLanSockets()
+        watchWifiChanges()
+        startAwayEngine()
+        Thread({ rxLoop() }, "intercom-rx").apply { isDaemon = true; start() }
+        Thread({ playLoop() }, "intercom-play").apply { isDaemon = true; start() }
+        Thread({ beaconLoop() }, "intercom-beacon").apply { isDaemon = true; start() }
+        pushState()
+    }
+
+    private fun startAwayEngine() {
+        val eng = AwayEngine(
+            context = applicationContext,
+            myId = myId,
+            myName = { myName },
+            isTransmitting = { transmitting },
+            onChat = { senderId, senderName, targetId, text ->
+                appendChat(ChatEntry(senderId, text, targetId != 0, false, System.currentTimeMillis(), true, senderName))
+                pushState()
+            },
+            onMicError = { msg ->
+                micError = msg
+                if (mode == Mode.AWAY) transmitting = false
+                pushState()
+            },
+            onState = { pushStateThrottled() },
+            onIdCollision = { main.post { onIdentityCollision() } }
+        )
+        away = eng
+        eng.start(familyCode)
+    }
+
+    private fun onIdentityCollision() {
+        val now = System.currentTimeMillis()
+        if (now - lastCollisionMs < 30_000) return
+        lastCollisionMs = now
+        myId = Identity.regenerate(this)
+        try {
+            away?.stop()
+        } catch (e: Exception) {
+        }
+        startAwayEngine()
+        sendBeacon()
+        pushState()
+    }
+
+    // ---------------------------------------------------------------- same-Wi-Fi (LAN)
+
+    private fun wifiInterface(): NetworkInterface? {
+        return try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val ip = wifi.connectionInfo?.ipAddress ?: 0
+            if (ip != 0) {
+                val addr = InetAddress.getByAddress(
+                    byteArrayOf(
+                        (ip and 0xFF).toByte(), ((ip shr 8) and 0xFF).toByte(),
+                        ((ip shr 16) and 0xFF).toByte(), ((ip shr 24) and 0xFF).toByte()
+                    )
+                )
+                wifiIpText = addr.hostAddress ?: ""
+                NetworkInterface.getByInetAddress(addr)?.let { return it }
+            } else {
+                wifiIpText = ""
+            }
+            NetworkInterface.getNetworkInterfaces()?.toList()?.firstOrNull {
+                it.isUp && !it.isLoopback && it.supportsMulticast() && it.name.startsWith("wlan")
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun openLanSockets(): Boolean {
+        return try {
+            val group = InetAddress.getByName(IntercomProtocol.GROUP)
+            groupAddr = group
+            val iface = wifiInterface()
+            val newTx = MulticastSocket().apply {
+                timeToLive = 2
+                if (iface != null) networkInterface = iface
+            }
+            val newRx = MulticastSocket(null as java.net.SocketAddress?).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(IntercomProtocol.PORT))
+                soTimeout = 1000
+            }
+            try {
+                newRx.joinGroup(InetSocketAddress(group, IntercomProtocol.PORT), iface)
+            } catch (e: Exception) {
+                @Suppress("DEPRECATION")
+                newRx.joinGroup(group)
+            }
+            val oldRx = rxSocket
+            val oldTx = txSocket
+            rxSocket = newRx
+            txSocket = newTx
+            try {
+                oldRx?.close()
+            } catch (e: Exception) {
+            }
+            try {
+                oldTx?.close()
+            } catch (e: Exception) {
+            }
+            wifiIpSnapshot = wifiIpText
+            engineError = null
+            true
+        } catch (e: Exception) {
+            // No Wi-Fi is normal on mobile data; AWAY mode still works.
+            engineError = if (mode == Mode.AWAY) null else "Same-Wi-Fi link not available: ${e.message ?: e.javaClass.simpleName}"
+            false
+        }
+    }
+
+    private fun watchWifiChanges() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            connectivity = cm
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                    if (!running) return
+                    val ip = lp.linkAddresses.firstOrNull { it.address is Inet4Address && !it.address.isLoopbackAddress }
+                        ?.address?.hostAddress ?: return
+                    if (ip == wifiIpSnapshot) return
+                    if (openLanSockets()) {
+                        sendBeacon()
+                        pushState()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    if (running) {
+                        wifiIpSnapshot = ""
+                        pushState()
+                    }
+                }
+            }
+            netCallback = cb
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), cb
+            )
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun rxLoop() {
+        val buf = ByteArray(2048)
+        while (running) {
+            val sock = rxSocket
+            if (sock == null || sock.isClosed) {
+                // v2.2 exited here forever when started without Wi-Fi. Wait instead.
+                try {
+                    Thread.sleep(500)
+                } catch (e: InterruptedException) {
+                    return
+                }
+                continue
+            }
+            val dp = DatagramPacket(buf, buf.size)
+            try {
+                sock.receive(dp)
+            } catch (e: java.net.SocketTimeoutException) {
+                continue
+            } catch (e: Exception) {
+                if (!running) return
+                try {
+                    Thread.sleep(200)
+                } catch (ie: InterruptedException) {
+                    return
+                }
+                continue
+            }
+            val pkt = IntercomProtocol.decode(dp.data, dp.length) ?: continue
+            handleLanPacket(pkt)
+        }
+    }
+
+    private fun handleLanPacket(pkt: IntercomProtocol.Packet) {
+        if (pkt.senderId == myId) {
+            if (pkt.type == IntercomProtocol.T_BEACON) {
+                val n = String(pkt.payload, Charsets.UTF_8).trim()
+                if (n.isNotEmpty() && n != myName) main.post { onIdentityCollision() }
+            }
+            return
+        }
+        val now = System.currentTimeMillis()
+        when (pkt.type) {
+            IntercomProtocol.T_BEACON -> {
+                val name = String(pkt.payload, Charsets.UTF_8).trim().ifEmpty { "A phone" }
+                if (peers.onBeacon(pkt.senderId, name, now)) pushState()
+            }
+            IntercomProtocol.T_AUDIO -> {
+                peers.onAudio(pkt.senderId, now)
+                if (!transmitting && mode == Mode.PUBLIC) queueFrame(pkt.payload)
+                pushStateThrottled()
+            }
+            IntercomProtocol.T_AUDIO_PRIVATE -> {
+                if (pkt.targetId == myId) {
+                    peers.onAudio(pkt.senderId, now)
+                    if (!transmitting && (mode == Mode.PUBLIC || mode == Mode.PRIVATE)) queueFrame(pkt.payload)
+                    pushStateThrottled()
+                }
+            }
+            IntercomProtocol.T_CHAT -> {
+                if (pkt.targetId == 0 || pkt.targetId == myId) {
+                    peers.onChat(pkt.senderId, now)
+                    appendChat(ChatEntry(pkt.senderId, pkt.text, pkt.targetId != 0, false, now, false))
+                    pushState()
+                }
+            }
+            IntercomProtocol.T_BYE -> if (peers.onBye(pkt.senderId)) pushState()
+        }
+    }
+
+    private fun queueFrame(frame: ByteArray) {
+        if (!playQueue.offer(frame)) {
+            playQueue.poll()
+            playQueue.offer(frame)
+        }
+    }
+
+    private fun playLoop() {
+        val minBuf = AudioTrack.getMinBufferSize(IntercomProtocol.SAMPLE_RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val track = try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setSampleRate(IntercomProtocol.SAMPLE_RATE)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .build()
+                )
+                .setBufferSizeInBytes(maxOf(minBuf, 5120))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+        } catch (e: Exception) {
+            null
+        }
+        player = track
+        if (track == null || track.state != AudioTrack.STATE_INITIALIZED) {
+            engineError = "Speaker problem: the audio output did not start on this phone"
+        } else {
+            try {
+                track.play()
+            } catch (e: Exception) {
+                engineError = "Speaker could not start on this phone: ${e.message ?: "audio refused"}"
+            }
+        }
+        while (running) {
+            try {
+                val frame = playQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (!transmitting && (mode == Mode.PUBLIC || mode == Mode.PRIVATE)) {
+                    player?.write(frame, 0, frame.size)
+                }
+            } catch (e: InterruptedException) {
+                return
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun beaconLoop() {
+        while (running) {
+            try {
+                sendBeacon()
+                if (peers.prune(System.currentTimeMillis())) pushState()
+                Thread.sleep(IntercomProtocol.BEACON_MS)
+            } catch (e: InterruptedException) {
+                return
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    /** Sends a UDP packet. Hops off the main thread, where Android forbids network calls. */
+    private fun sendRaw(bytes: ByteArray) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                netExec.execute { sendRawNow(bytes) }
+            } catch (e: Exception) {
+            }
+        } else {
+            sendRawNow(bytes)
+        }
+    }
+
+    private fun sendRawNow(bytes: ByteArray) {
+        try {
+            val sock = txSocket ?: return
+            val addr = groupAddr ?: return
+            sock.send(DatagramPacket(bytes, bytes.size, addr, IntercomProtocol.PORT))
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun sendBeacon() = sendRaw(IntercomProtocol.encodeBeacon(myId, myName))
+
+    // ---------------------------------------------------------------- user actions
+
+    private fun selectedAwayMember(): AwayEngine.Member? {
+        val eng = away ?: return null
+        val id = selectedAwayMemberId
+        if (id == 0) return null
+        return eng.snapshot(System.currentTimeMillis()).firstOrNull { it.id == id }
+    }
+
+    fun selectAwayMember(id: Int) {
+        selectedAwayMemberId = if (selectedAwayMemberId == id) 0 else id
+        FamilyCodeStore.setSelectedMember(this, selectedAwayMemberId)
+        pushState()
+    }
+
+    fun joinFamily(newCode: String) {
+        familyCode = newCode
+        FamilyCodeStore.setCode(this, newCode)
+        selectedAwayMemberId = 0
+        FamilyCodeStore.setSelectedMember(this, 0)
+        away?.restart(newCode)
+        pushState()
+    }
+
+    fun rename(name: String) {
+        val clean = name.trim().take(24)
+        if (clean.isEmpty()) return
+        myName = clean
+        Identity.setName(this, clean)
+        sendBeacon()
+        pushState()
+    }
+
+    fun setMode(m: Mode) {
+        if (mode == m) return
+        if (transmitting) stopTalk()
+        mode = m
+        micError = null
+        FamilyCodeStore.setModeName(this, m.name)
+        pushState()
+    }
+
+    fun toggleSelectPeer(id: Int) {
+        selectedPeerId = if (selectedPeerId == id) 0 else id
+        FamilyCodeStore.setSelectedPeer(this, selectedPeerId)
+        pushState()
+    }
+
+    private fun appendChat(e: ChatEntry) {
+        synchronized(chatLock) {
+            chatHistory.add(e)
+            while (chatHistory.size > 100) chatHistory.removeAt(0)
+        }
+    }
+
+    private fun lanTargetAlive(target: Int): Boolean = target != 0 && peers.snapshot().any { it.id == target }
+
+    private fun awayNotReadyText(eng: AwayEngine?): String = when {
+        eng == null -> "AWAY: engine not started"
+        !eng.connected -> "AWAY: not connected yet — check this phone's internet"
+        else -> "AWAY: still preparing the family key — try again in a moment"
+    }
+
+    fun sendChat(text: String): Boolean {
+        val clean = text.trim()
+        if (clean.isEmpty()) return false
+        val now = System.currentTimeMillis()
+        when (mode) {
+            Mode.BROADCAST -> {
+                micError = "Use the Public Broadcast panel for public posts"
+                pushState()
+                return false
+            }
+            Mode.PRIVATE -> {
+                val target = selectedPeerId
+                if (!lanTargetAlive(target)) {
+                    micError = "Private mode: tap a name in the list first"
+                    pushState()
+                    return false
+                }
+                sendRaw(IntercomProtocol.encodeChat(myId, chatSeq++, target, clean))
+                appendChat(ChatEntry(myId, clean, true, true, now, false))
+            }
+            Mode.AWAY -> {
+                val eng = away
+                if (eng == null || !eng.ready) {
+                    micError = awayNotReadyText(eng)
+                    pushState()
+                    return false
+                }
+                val target = selectedAwayMemberId
+                if (target != 0 && !eng.isOnline(target, now)) {
+                    micError = "AWAY: ${eng.memberName(target) ?: "That phone"} is not online right now"
+                    pushState()
+                    return false
+                }
+                if (!eng.sendChat(target, clean)) {
+                    micError = "AWAY: message could not be sent — the connection dropped"
+                    pushState()
+                    return false
+                }
+                appendChat(ChatEntry(myId, clean, target != 0, true, now, true, myName))
+            }
+            Mode.PUBLIC -> {
+                sendRaw(IntercomProtocol.encodeChat(myId, chatSeq++, 0, clean))
+                appendChat(ChatEntry(myId, clean, false, true, now, false))
+            }
+        }
+        micError = null
+        pushState()
+        return true
+    }
+
+    fun startTalk() {
+        if (transmitting || !running || mode == Mode.BROADCAST) return
+        if (mode == Mode.PRIVATE && !lanTargetAlive(selectedPeerId)) {
+            micError = "Private mode: tap a name in the list first"
+            pushState()
+            return
+        }
+        if (mode == Mode.AWAY) {
+            val eng = away
+            if (eng == null || !eng.ready) {
+                micError = awayNotReadyText(eng)
+                pushState()
+                return
+            }
+            val target = selectedAwayMemberId
+            if (target == 0) {
+                micError = "AWAY mode: tap a name in the family list first"
+                pushState()
+                return
+            }
+            if (!eng.isOnline(target, System.currentTimeMillis())) {
+                micError = "AWAY: ${eng.memberName(target) ?: "That phone"} is not online right now"
+                pushState()
+                return
+            }
+            micError = null
+            transmitting = true
+            if (!eng.beginClip(target)) {
+                transmitting = false
+                micError = "AWAY: could not start recording — wait a moment, then hold TALK again"
+            }
+            pushState()
+            return
+        }
+        if (txThread?.isAlive == true) return
+        micError = null
+        txPackets = 0
+        silentFrames = 0
+        silenceWarn = false
+        val txMode = mode
+        val txTarget = selectedPeerId
+        val gen = ++txGen
+        transmitting = true
+        playQueue.clear()
+        pushState()
+        txThread = Thread({ txRun(txMode, txTarget, gen) }, "intercom-tx").apply { isDaemon = true; start() }
+    }
+
+    private fun tryCreateRecorder(source: Int): AudioRecord? {
+        val minBuf = AudioRecord.getMinBufferSize(IntercomProtocol.SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) return null
+        return try {
+            val rec = AudioRecord(source, IntercomProtocol.SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, 2560))
+            if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                rec.release()
+                return null
+            }
+            try {
+                audioManager?.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                    ?.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+                    ?.let { rec.setPreferredDevice(it) }
+            } catch (e: Exception) {
+            }
+            try {
+                AcousticEchoCanceler.create(rec.audioSessionId)?.enabled = true
+            } catch (e: Exception) {
+            }
+            try {
+                NoiseSuppressor.create(rec.audioSessionId)?.enabled = true
+            } catch (e: Exception) {
+            }
+            try {
+                AutomaticGainControl.create(rec.audioSessionId)?.enabled = true
+            } catch (e: Exception) {
+            }
+            rec
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun releaseRecorder(rec: AudioRecord) {
+        try {
+            rec.stop()
+        } catch (e: Exception) {
+        }
+        try {
+            rec.release()
+        } catch (e: Exception) {
+        }
+        if (recorder === rec) recorder = null
+    }
+
+    private fun txRun(txMode: Mode, txTarget: Int, gen: Int) {
+        var streamed = false
+        for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)) {
+            if (!transmitting || txGen != gen) break
+            val rec = tryCreateRecorder(source) ?: continue
+            recorder = rec
+            val started = try {
+                rec.startRecording()
+                rec.recordingState == AudioRecord.RECORDSTATE_RECORDING
+            } catch (e: Exception) {
+                false
+            }
+            if (!started) {
+                releaseRecorder(rec)
+                continue
+            }
+            val ended = pump(rec, txMode, txTarget, gen)
+            releaseRecorder(rec)
+            if (ended) {
+                streamed = true
+                break
+            }
+        }
+        if (!streamed && transmitting && txGen == gen && micError == null) {
+            micError = "Mic blocked: voice mode and plain mode both failed"
+        }
+        if (txGen == gen) transmitting = false
+        pushState()
+    }
+
+    /** Streams one recorder. Returns false only if it failed before sending anything (try the next source). */
+    private fun pump(rec: AudioRecord, txMode: Mode, txTarget: Int, gen: Int): Boolean {
+        val frame = ByteArray(IntercomProtocol.FRAME_BYTES)
+        var seq = 0
+        var sentAny = false
+        while (transmitting && txGen == gen) {
+            var filled = 0
+            var readFailed = false
+            while (filled < frame.size && transmitting && txGen == gen) {
+                val n = try {
+                    rec.read(frame, filled, frame.size - filled)
+                } catch (e: Exception) {
+                    -1
+                }
+                if (n <= 0) {
+                    readFailed = true
+                    break
+                }
+                filled += n
+            }
+            if (filled > 0) {
+                noteFrameLevel(frame, filled)
+                val packet = if (txMode == Mode.PRIVATE) {
+                    IntercomProtocol.encodeAudioPrivate(myId, seq, txTarget, frame, filled)
+                } else {
+                    IntercomProtocol.encodeAudio(myId, seq, frame, filled)
+                }
+                seq++
+                sendRaw(packet)
+                txPackets++
+                pushStateThrottled()
+                sentAny = true
+            }
+            if (readFailed) {
+                if (!transmitting || txGen != gen) return true
+                if (!sentAny) return false
+                micError = "Mic stopped mid-send — hold TALK to retry"
+                return true
+            }
+        }
+        return true
+    }
+
+    private fun noteFrameLevel(frame: ByteArray, filled: Int) {
+        var peak = 0
+        var i = 0
+        while (i + 1 < filled) {
+            val s = Math.abs(((frame[i].toInt() and 0xFF) or (frame[i + 1].toInt() shl 8)).toShort().toInt())
+            if (s > peak) peak = s
+            i += 2
+        }
+        if (peak == 0) {
+            silentFrames++
+            if (silentFrames >= 100) silenceWarn = true
+        } else {
+            silentFrames = 0
+            silenceWarn = false
+        }
+    }
+
+    fun stopTalk() {
+        if (!transmitting) return
+        transmitting = false
+        if (mode == Mode.AWAY) away?.endClip()
+        try {
+            recorder?.stop()
+        } catch (e: Exception) {
+        }
+        pushState()
+    }
+
+    fun addListener(l: StateListener) {
+        listeners.add(l)
+        pushState()
+    }
+
+    fun removeListener(l: StateListener) {
+        listeners.remove(l)
+    }
+
+    // ---------------------------------------------------------------- UI state
+
+    private fun pushStateThrottled() {
+        if (System.currentTimeMillis() - lastPush > 400) pushState()
+    }
+
+    fun pushState() {
+        val now = System.currentTimeMillis()
+        lastPush = now
+        val snap = peers.snapshot()
+        val chatSnap = synchronized(chatLock) { chatHistory.toList() }
+        val eng = away
+        val awaySnap = eng?.snapshot(now) ?: emptyList()
+
+        val peerUi = snap.map { PeerUi(it.id, it.name, it.lastAudioMs > 0 && now - it.lastAudioMs < 700) }
+        val lanSpeaker = snap.filter { it.lastAudioMs > 0 && now - it.lastAudioMs < 700 }.maxByOrNull { it.lastAudioMs }?.name
+        val awaySpeaker = awaySnap.firstOrNull { it.lastAudioMs > 0 && now - it.lastAudioMs < 700 }?.name
+        val chatUi = chatSnap.map { e ->
+            val name = when {
+                e.mine -> myName
+                e.away -> e.senderName.ifEmpty { eng?.memberName(e.senderId) ?: "Family phone" }
+                else -> snap.firstOrNull { it.id == e.senderId }?.name ?: "A phone"
+            }
+            ChatUi(e.senderId, name, e.text, e.isPrivate, e.mine, e.timeMs, e.away)
+        }
+        val awayUi = awaySnap.map {
+            AwayPeerUi(it.id, it.name, eng?.isOnline(it, now) == true, it.lastAudioMs > 0 && now - it.lastAudioMs < 700, it.id == selectedAwayMemberId)
+        }
+        val state = UiState(
+            myName = myName,
+            peers = peerUi,
+            transmitting = transmitting,
+            speakingNow = awaySpeaker ?: lanSpeaker,
+            detail = detailText(snap, now),
+            mode = mode,
+            selectedPeerId = selectedPeerId,
+            chat = chatUi,
+            awayPeers = awayUi,
+            selectedAwayId = selectedAwayMemberId,
+            awayConnected = eng?.ready == true,
+            familyCode = familyCode
+        )
+        main.post { listeners.forEach { it.onState(state) } }
+    }
+
+    private fun detailText(snap: List<PeerTable.Peer>, now: Long): String {
+        val eng = away
+        // Voice-message progress (recording, sending, delivered, played) wins in every mode,
+        // because a message can arrive while you are on another tab.
+        eng?.statusLine(now)?.let { return it }
+        if (transmitting) {
+            if (silenceWarn) return "Mic is hearing silence — check Bluetooth / mic"
+            return "Sending — $txPackets packets out"
+        }
+        micError?.let { return it }
+        if (mode != Mode.AWAY) engineError?.let { return it }
+        when (mode) {
+            Mode.PRIVATE -> {
+                val sel = snap.firstOrNull { it.id == selectedPeerId }
+                return if (sel != null) "Private → ${sel.name}" else "Private mode — tap a name in the list"
+            }
+            Mode.BROADCAST -> return "Public Broadcast — nothing is sent until you share it"
+            Mode.AWAY -> {
+                if (eng == null) return "AWAY — engine not started"
+                if (!eng.connected) {
+                    val err = eng.lastError
+                    return if (err != null) "AWAY — relay problem: $err (retrying)" else "AWAY — connecting to the relays…"
+                }
+                if (!eng.ready) return "AWAY — preparing the family key…"
+                val relays = " • ${eng.relaysUp}/${AwayEngine.RELAYS.size} relays"
+                val sel = selectedAwayMember() ?: return "AWAY — tap a name in the family list above$relays"
+                return if (eng.isOnline(sel.id, now)) {
+                    "AWAY → ${sel.name} • hold TALK, release to send$relays"
+                } else {
+                    "AWAY → ${sel.name} is not online right now$relays"
+                }
+            }
+            Mode.PUBLIC -> {
+                val ip = wifiIpText.ifEmpty { "…" }
+                return "Wi-Fi $ip • listening on ${IntercomProtocol.GROUP}:${IntercomProtocol.PORT}"
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        stopTalk()
+        try {
+            away?.stop()
+        } catch (e: Exception) {
+        }
+        netCallback?.let {
+            try {
+                connectivity?.unregisterNetworkCallback(it)
+            } catch (e: Exception) {
+            }
+        }
+        netCallback = null
+        running = false
+        val rx = rxSocket
+        val tx = txSocket
+        val bye = IntercomProtocol.encodeBye(myId)
+        // Say goodbye and close the sockets off the main thread.
+        try {
+            netExec.execute {
+                repeat(2) { sendRawNow(bye) }
+                try {
+                    rx?.close()
+                } catch (e: Exception) {
+                }
+                try {
+                    tx?.close()
+                } catch (e: Exception) {
+                }
+            }
+        } catch (e: Exception) {
+        }
+        try {
+            player?.release()
+        } catch (e: Exception) {
+        }
+        try {
+            multicastLock?.release()
+        } catch (e: Exception) {
+        }
+        try {
+            wakeLock?.release()
+        } catch (e: Exception) {
+        }
+        netExec.shutdown()
+        super.onDestroy()
     }
 }

@@ -11,12 +11,12 @@ android {
         applicationId = "com.khalsa.intercom"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Higher than v2.2 (7) so it installs over it and keeps the family code and names.
+        versionCode = 8
+        versionName = "2.3"
     }
 
-    // A fixed debug key (app/debug.keystore, created by the CI workflow or Android Studio)
-    // keeps every build installable over the previous one.
+    // Same key that signed v2.2 (app/debug.keystore), so the update installs in place.
     signingConfigs {
         getByName("debug") {
             val ks = file("debug.keystore")
@@ -45,10 +45,10 @@ android {
     }
     lint {
         abortOnError = false
+        checkReleaseBuilds = false
     }
 }
 
 dependencies {
-    // Lightweight pure-Java MQTT client used to relay messages over Wi-Fi or mobile data.
-    implementation("org.eclipse.paho:org.eclipse.paho.client.mqttv3:1.2.5")
+    testImplementation("junit:junit:4.13.2")
 }

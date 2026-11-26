@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2.3-mobile-data-fix]
   workflow_dispatch:
 
 permissions:
@@ -21,23 +21,25 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Build
+      - name: Test and build
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease
-          cp app/build/outputs/apk/release/app-release.apk KJIntercom.apk
+          ./gradlew --no-daemon testReleaseUnitTest assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk KHALSA-Intercom.apk
 
       - uses: actions/upload-artifact@v4
         with:
-          name: KJIntercom-apk
-          path: KJIntercom.apk
+          name: KHALSA-Intercom-apk
+          path: KHALSA-Intercom.apk
 
-      - name: Publish as "latest" release (easy phone download)
+      - name: Publish release (easy phone download)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest KJIntercom.apk \
-            --title "KJ Intercom (build ${{ github.run_number }})" \
-            --notes "Tap KJIntercom.apk below to download, then install it on both phones."
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then TAG=latest; else TAG=v2.3; fi
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" KHALSA-Intercom.apk \
+            --target "$GITHUB_SHA" \
+            --title "KHALSA Intercom $TAG (build ${{ github.run_number }})" \
+            --notes "Tap KHALSA-Intercom.apk below to download, then install it on BOTH phones. It installs over v2.2 and keeps your family code."

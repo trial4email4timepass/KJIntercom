@@ -119,6 +119,12 @@ class IntercomService : Service() {
     @Volatile private var txPackets = 0
     @Volatile private var silentFrames = 0
     @Volatile private var silenceWarn = false
+    // What this phone is hearing on Wi-Fi, shown in the status line so failures are visible.
+    @Volatile private var rxFromId = 0
+    @Volatile private var rxPackets = 0
+    @Volatile private var rxPeak = 0
+    @Volatile private var rxFirstMs = 0L
+    @Volatile private var rxLastMs = 0L
     @Volatile private var micError: String? = null
     @Volatile private var engineError: String? = null
     @Volatile private var lastPush = 0L
@@ -385,11 +391,11 @@ class IntercomService : Service() {
                 continue
             }
             val pkt = IntercomProtocol.decode(dp.data, dp.length) ?: continue
-            handleLanPacket(pkt)
+            handleLanPacket(pkt, dp.address)
         }
     }
 
-    private fun handleLanPacket(pkt: IntercomProtocol.Packet) {
+    private fun handleLanPacket(pkt: IntercomProtocol.Packet, from: InetAddress?) {
         if (pkt.senderId == myId) {
             if (pkt.type == IntercomProtocol.T_BEACON) {
                 val n = String(pkt.payload, Charsets.UTF_8).trim()
@@ -401,29 +407,51 @@ class IntercomService : Service() {
         when (pkt.type) {
             IntercomProtocol.T_BEACON -> {
                 val name = String(pkt.payload, Charsets.UTF_8).trim().ifEmpty { "A phone" }
-                if (peers.onBeacon(pkt.senderId, name, now)) pushState()
+                if (peers.onBeacon(pkt.senderId, name, now, from)) pushState()
             }
             IntercomProtocol.T_AUDIO -> {
-                peers.onAudio(pkt.senderId, now)
-                if (!transmitting && mode == Mode.PUBLIC) queueFrame(pkt.payload)
+                // Hear everyone in every mode; the mode only decides who YOU talk to.
+                peers.onAudio(pkt.senderId, now, from)
+                onHeardFrame(pkt.senderId, pkt.payload, now)
+                if (!transmitting) queueFrame(pkt.payload)
                 pushStateThrottled()
             }
             IntercomProtocol.T_AUDIO_PRIVATE -> {
                 if (pkt.targetId == myId) {
-                    peers.onAudio(pkt.senderId, now)
-                    if (!transmitting && (mode == Mode.PUBLIC || mode == Mode.PRIVATE)) queueFrame(pkt.payload)
+                    peers.onAudio(pkt.senderId, now, from)
+                    onHeardFrame(pkt.senderId, pkt.payload, now)
+                    if (!transmitting) queueFrame(pkt.payload)
                     pushStateThrottled()
                 }
             }
             IntercomProtocol.T_CHAT -> {
                 if (pkt.targetId == 0 || pkt.targetId == myId) {
-                    peers.onChat(pkt.senderId, now)
+                    peers.onChat(pkt.senderId, now, from)
                     appendChat(ChatEntry(pkt.senderId, pkt.text, pkt.targetId != 0, false, now, false))
                     pushState()
                 }
             }
             IntercomProtocol.T_BYE -> if (peers.onBye(pkt.senderId)) pushState()
         }
+    }
+
+    private fun onHeardFrame(sender: Int, pcm: ByteArray, now: Long) {
+        if (sender != rxFromId || now - rxLastMs > 1500) {
+            rxFromId = sender
+            rxPackets = 0
+            rxPeak = 0
+            rxFirstMs = now
+        }
+        rxPackets++
+        rxLastMs = now
+        var i = 0
+        var peak = rxPeak
+        while (i + 1 < pcm.size) {
+            val v = Math.abs(((pcm[i].toInt() and 0xFF) or (pcm[i + 1].toInt() shl 8)).toShort().toInt())
+            if (v > peak) peak = v
+            i += 2
+        }
+        rxPeak = peak
     }
 
     private fun queueFrame(frame: ByteArray) {
@@ -469,9 +497,7 @@ class IntercomService : Service() {
         while (running) {
             try {
                 val frame = playQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                if (!transmitting && (mode == Mode.PUBLIC || mode == Mode.PRIVATE)) {
-                    player?.write(frame, 0, frame.size)
-                }
+                if (!transmitting) player?.write(frame, 0, frame.size)
             } catch (e: InterruptedException) {
                 return
             } catch (e: Exception) {
@@ -514,6 +540,31 @@ class IntercomService : Service() {
     }
 
     private fun sendBeacon() = sendRaw(IntercomProtocol.encodeBeacon(myId, myName))
+
+    /**
+     * Sends a voice frame straight to each listening phone (unicast). v2.2 multicast every
+     * frame to the whole network; many routers throttle or drop a steady multicast stream
+     * (or deliver it only in bursts to phones in power save) even though the odd chat
+     * packet gets through, which is exactly "text arrives, voice doesn't". Unicast Wi-Fi
+     * frames are retried and sent at full speed. Falls back to multicast if no address is known.
+     */
+    private fun sendVoice(packet: ByteArray, txMode: Mode, txTarget: Int) {
+        val sock = txSocket ?: return
+        val targets = peers.snapshot()
+            .filter { if (txMode == Mode.PRIVATE) it.id == txTarget else true }
+            .mapNotNull { it.addr }
+            .distinct()
+        if (targets.isEmpty()) {
+            sendRawNow(packet)
+            return
+        }
+        for (addr in targets) {
+            try {
+                sock.send(DatagramPacket(packet, packet.size, addr, IntercomProtocol.PORT))
+            } catch (e: Exception) {
+            }
+        }
+    }
 
     // ---------------------------------------------------------------- user actions
 
@@ -654,9 +705,11 @@ class IntercomService : Service() {
                 return
             }
             micError = null
-            transmitting = true
-            if (!eng.beginClip(target)) {
-                transmitting = false
+            // Start recording before flagging "talking", so pushState never sees talking
+            // without a recording and resets it mid-press.
+            if (eng.beginClip(target)) {
+                transmitting = true
+            } else {
                 micError = "AWAY: could not start recording — wait a moment, then hold TALK again"
             }
             pushState()
@@ -723,7 +776,8 @@ class IntercomService : Service() {
 
     private fun txRun(txMode: Mode, txTarget: Int, gen: Int) {
         var streamed = false
-        for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)) {
+        // Plain MIC first: VOICE_COMMUNICATION is quiet or silent on some phones outside a call.
+        for (source in intArrayOf(MediaRecorder.AudioSource.MIC, MediaRecorder.AudioSource.VOICE_COMMUNICATION)) {
             if (!transmitting || txGen != gen) break
             val rec = tryCreateRecorder(source) ?: continue
             recorder = rec
@@ -779,11 +833,13 @@ class IntercomService : Service() {
                     IntercomProtocol.encodeAudio(myId, seq, frame, filled)
                 }
                 seq++
-                sendRaw(packet)
+                sendVoice(packet, txMode, txTarget)
                 txPackets++
                 pushStateThrottled()
                 sentAny = true
             }
+            // 1.5 s of pure digital silence: this mic source is blocked, try the other one.
+            if (silentFrames == 75 && seq == 75) return false
             if (readFailed) {
                 if (!transmitting || txGen != gen) return true
                 if (!sentAny) return false
@@ -879,11 +935,26 @@ class IntercomService : Service() {
         main.post { listeners.forEach { it.onState(state) } }
     }
 
+    private fun hearingText(snap: List<PeerTable.Peer>, now: Long): String? {
+        if (rxFromId == 0 || now - rxLastMs > 8000) return null
+        val who = snap.firstOrNull { it.id == rxFromId }?.name ?: "a phone"
+        val level = rxPeak * 100 / 32767
+        val volumeOff = (audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: 1) == 0
+        val live = now - rxLastMs < 1500
+        return when {
+            rxPeak == 0 -> "Receiving from $who, but their microphone is sending SILENCE — check mic permission on that phone"
+            volumeOff -> "Receiving from $who but MEDIA VOLUME IS OFF on this phone — turn the volume up"
+            live -> "🔊 Hearing $who — level $level% (${rxPackets} packets)"
+            else -> "Last heard $who: ${(rxLastMs - rxFirstMs + 500) / 1000}s, level $level%"
+        }
+    }
+
     private fun detailText(snap: List<PeerTable.Peer>, now: Long): String {
         val eng = away
         // Voice-message progress (recording, sending, delivered, played) wins in every mode,
         // because a message can arrive while you are on another tab.
         eng?.statusLine(now)?.let { return it }
+        hearingText(snap, now)?.let { return it }
         if (transmitting) {
             if (silenceWarn) return "Mic is hearing silence — check Bluetooth / mic"
             return "Sending — $txPackets packets out"

@@ -91,39 +91,53 @@ object IntercomProtocol {
 
 /** Phones seen on the same Wi-Fi. */
 class PeerTable {
-    data class Peer(val id: Int, var name: String, var lastSeenMs: Long, var lastAudioMs: Long = 0L)
+    /** [addr] is the phone's Wi-Fi address, learned from its packets, so voice can go to it directly. */
+    data class Peer(
+        val id: Int,
+        var name: String,
+        var lastSeenMs: Long,
+        var lastAudioMs: Long = 0L,
+        var addr: java.net.InetAddress? = null
+    )
 
     private val peers = LinkedHashMap<Int, Peer>()
 
     /** Returns true when the visible list changed. */
     @Synchronized
-    fun onBeacon(id: Int, name: String, now: Long): Boolean {
+    fun onBeacon(id: Int, name: String, now: Long, addr: java.net.InetAddress? = null): Boolean {
         val p = peers[id]
         if (p == null) {
-            peers[id] = Peer(id, name, now)
+            peers[id] = Peer(id, name, now, addr = addr)
             return true
         }
         val changed = p.name != name
         p.name = name
         p.lastSeenMs = now
+        if (addr != null) p.addr = addr
         return changed
     }
 
     @Synchronized
-    fun onAudio(id: Int, now: Long) {
+    fun onAudio(id: Int, now: Long, addr: java.net.InetAddress? = null) {
         val p = peers[id]
         if (p == null) {
-            peers[id] = Peer(id, "A phone", now, now)
+            peers[id] = Peer(id, "A phone", now, now, addr)
         } else {
             p.lastAudioMs = now
             p.lastSeenMs = now
+            if (addr != null) p.addr = addr
         }
     }
 
     @Synchronized
-    fun onChat(id: Int, now: Long) {
+    fun onChat(id: Int, now: Long, addr: java.net.InetAddress? = null) {
         val p = peers[id]
-        if (p == null) peers[id] = Peer(id, "A phone", now) else p.lastSeenMs = now
+        if (p == null) {
+            peers[id] = Peer(id, "A phone", now, addr = addr)
+        } else {
+            p.lastSeenMs = now
+            if (addr != null) p.addr = addr
+        }
     }
 
     @Synchronized
